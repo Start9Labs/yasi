@@ -10,6 +10,9 @@ use std::sync::{Arc, RwLock, Weak};
 
 use hashbrown::raw::RawTable;
 
+#[cfg(feature = "serde")]
+mod serde;
+
 #[inline]
 #[cold]
 fn cold() {}
