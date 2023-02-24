@@ -104,14 +104,14 @@ impl InternedString {
         }
     }
 
-    pub fn from_display<T: Display>(t: &T) -> Self {
-        struct IntoString<'a, T>(&'a T);
-        impl<'a, T: Display> From<IntoString<'a, T>> for String {
+    pub fn from_display<T: Display + ?Sized>(t: &T) -> Self {
+        struct IntoString<'a, T: ?Sized>(&'a T);
+        impl<'a, T: Display + ?Sized> From<IntoString<'a, T>> for String {
             fn from(value: IntoString<'a, T>) -> Self {
                 value.0.to_string()
             }
         }
-        impl<'a, T: Display> std::fmt::Display for IntoString<'a, T> {
+        impl<'a, T: Display + ?Sized> std::fmt::Display for IntoString<'a, T> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 self.0.fmt(f)
             }
