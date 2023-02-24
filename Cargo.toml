@@ -1,12 +1,13 @@
 [package]
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 name = "yasi"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Yet Another String Interner"
 license = "MIT"
 documentation = "https://docs.rs/yasi"
 repository = "https://github.com/Start9Labs/yasi.git"
+keywords = ["arc", "intern", "string", "display"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]

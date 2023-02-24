@@ -129,9 +129,12 @@ impl InternedString {
 
 impl Drop for InternedString {
     fn drop(&mut self) {
-        let s = std::mem::take(&mut self.0);
-        if Arc::strong_count(&s) == 1 {
-            let s = Arc::try_unwrap(s).unwrap_or_else(|s| s.deref().clone());
+        if Arc::strong_count(&self.0) == 1 {
+            let s = std::mem::take(&mut self.0);
+            let s = Arc::try_unwrap(s).unwrap_or_else(|s| {
+                cold();
+                s.deref().clone()
+            });
             let hash = DisplayHasher::<TableHasher>::hash(&s);
             let eq = |s: &Weak<String>| s.strong_count() == 0;
             let mut guard = TABLE.write().unwrap();
@@ -207,11 +210,7 @@ impl Display for InternedString {
 
 impl PartialEq for InternedString {
     fn eq(&self, other: &Self) -> bool {
-        if Arc::ptr_eq(&self.0, &other.0) {
-            true
-        } else {
-            self.0.deref() == other.0.deref()
-        }
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
