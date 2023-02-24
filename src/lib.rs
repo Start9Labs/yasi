@@ -18,7 +18,7 @@ mod serde;
 fn cold() {}
 
 lazy_static::lazy_static! {
-    static ref TABLE: RwLock<RawTable<Weak<String>>> = RwLock::new(RawTable::new());
+    static ref TABLE: RwLock<RawTable<Weak<TableString>>> = RwLock::new(RawTable::new());
 }
 
 type TableHasher = ahash::AHasher;
@@ -67,13 +67,27 @@ impl<'a> std::fmt::Write for DisplayEq<'a> {
     }
 }
 
-pub struct InternedString(Arc<String>);
+struct TableString(String);
+impl Drop for TableString {
+    fn drop(&mut self) {
+        let hash = DisplayHasher::<TableHasher>::hash(&self.0);
+        let eq = |s: &Weak<TableString>| s.strong_count() == 0;
+        let mut guard = TABLE.write().unwrap();
+        if !guard.erase_entry(hash, eq) {
+            cold();
+            let hash = TableHasher::default().finish();
+            guard.erase_entry(hash, eq);
+        }
+    }
+}
+
+pub struct InternedString(Arc<TableString>);
 impl InternedString {
     pub fn intern<T: Display + Into<String>>(t: T) -> Self {
         let hash = DisplayHasher::<TableHasher>::hash(&t);
-        let eq = |s: &Weak<String>| {
+        let eq = |s: &Weak<TableString>| {
             if let Some(s) = Weak::upgrade(s) {
-                DisplayEq::eq(&t, s.as_str())
+                DisplayEq::eq(&t, s.0.as_str())
             } else {
                 false
             }
@@ -93,17 +107,17 @@ impl InternedString {
                 if let Some(s) = Weak::upgrade(s) {
                     return Self(s);
                 } else {
-                    let res = Arc::new(t.into());
+                    let res = Arc::new(TableString(t.into()));
                     *s = Arc::downgrade(&res);
                     return Self(res);
                 }
             }
             // we need to create it
-            let res: Arc<String> = Arc::new(t.into());
+            let res = Arc::new(TableString(t.into()));
             guard.insert(hash, Arc::downgrade(&res), |s| {
                 let mut hasher = TableHasher::default();
                 if let Some(s) = Weak::upgrade(s) {
-                    hasher.write(s.as_bytes())
+                    hasher.write(s.0.as_bytes())
                 }
                 hasher.finish()
             });
@@ -127,60 +141,40 @@ impl InternedString {
     }
 }
 
-impl Drop for InternedString {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.0) == 1 {
-            let s = std::mem::take(&mut self.0);
-            let s = Arc::try_unwrap(s).unwrap_or_else(|s| {
-                cold();
-                s.deref().clone()
-            });
-            let hash = DisplayHasher::<TableHasher>::hash(&s);
-            let eq = |s: &Weak<String>| s.strong_count() == 0;
-            let mut guard = TABLE.write().unwrap();
-            if !guard.erase_entry(hash, eq) {
-                cold();
-                let hash = TableHasher::default().finish();
-                guard.erase_entry(hash, eq);
-            }
-        }
-    }
-}
-
 impl Deref for InternedString {
     type Target = str;
     fn deref(&self) -> &Self::Target {
-        self.0.deref().deref()
+        self.0.deref().0.deref()
     }
 }
 
 impl AsRef<[u8]> for InternedString {
     fn as_ref(&self) -> &[u8] {
-        self.0.deref().as_ref()
+        self.0.deref().0.as_ref()
     }
 }
 
 impl AsRef<OsStr> for InternedString {
     fn as_ref(&self) -> &OsStr {
-        self.0.deref().as_ref()
+        self.0.deref().0.as_ref()
     }
 }
 
 impl AsRef<Path> for InternedString {
     fn as_ref(&self) -> &Path {
-        self.0.deref().as_ref()
+        self.0.deref().0.as_ref()
     }
 }
 
 impl AsRef<str> for InternedString {
     fn as_ref(&self) -> &str {
-        self.0.deref().as_ref()
+        self.0.deref().0.as_ref()
     }
 }
 
 impl Borrow<str> for InternedString {
     fn borrow(&self) -> &str {
-        self.0.deref().borrow()
+        self.0.deref().0.borrow()
     }
 }
 
@@ -192,7 +186,7 @@ impl Clone for InternedString {
 
 impl Debug for InternedString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(self.0.deref(), f)
+        Debug::fmt(&self.0.deref().0, f)
     }
 }
 
@@ -204,7 +198,7 @@ impl Default for InternedString {
 
 impl Display for InternedString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(self.0.deref(), f)
+        Display::fmt(&self.0.deref().0, f)
     }
 }
 
@@ -221,7 +215,7 @@ impl PartialOrd for InternedString {
         if Arc::ptr_eq(&self.0, &other.0) {
             Some(std::cmp::Ordering::Equal)
         } else {
-            self.0.deref().partial_cmp(other.0.deref())
+            self.0.deref().0.partial_cmp(&other.0.deref().0)
         }
     }
 }
@@ -231,7 +225,7 @@ impl Ord for InternedString {
         if Arc::ptr_eq(&self.0, &other.0) {
             std::cmp::Ordering::Equal
         } else {
-            self.0.deref().cmp(other.0.deref())
+            self.0.deref().0.cmp(&other.0.deref().0)
         }
     }
 }
@@ -251,24 +245,24 @@ impl FromStr for InternedString {
 
 impl Hash for InternedString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.deref().hash(state)
+        self.0.deref().0.hash(state)
     }
 }
 
 impl<'a> PartialEq<&'a str> for InternedString {
     fn eq(&self, other: &&'a str) -> bool {
-        self.0.deref().eq(other)
+        self.0.deref().0.eq(other)
     }
 }
 
 impl<'a> PartialEq<Cow<'a, str>> for InternedString {
     fn eq(&self, other: &Cow<'a, str>) -> bool {
-        self.0.deref().eq(other)
+        self.0.deref().0.eq(other)
     }
 }
 
 impl PartialEq<str> for InternedString {
     fn eq(&self, other: &str) -> bool {
-        self.0.deref().eq(other)
+        self.0.deref().0.eq(other)
     }
 }
