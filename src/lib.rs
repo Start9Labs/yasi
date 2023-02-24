@@ -78,32 +78,36 @@ impl InternedString {
                 false
             }
         };
-        loop {
-            // READ section
-            {
-                if let Some(s) = TABLE.read().unwrap().get(hash, eq).and_then(Weak::upgrade) {
+        // READ section
+        {
+            if let Some(s) = TABLE.read().unwrap().get(hash, eq).and_then(Weak::upgrade) {
+                return Self(s);
+            }
+        }
+        // WRITE section
+        {
+            let mut guard = TABLE.write().unwrap();
+            // RACE CONDITION: check again if it exists
+            if let Some(s) = guard.get_mut(hash, eq) {
+                cold(); // unlikely
+                if let Some(s) = Weak::upgrade(s) {
                     return Self(s);
+                } else {
+                    let res = Arc::new(t.into());
+                    *s = Arc::downgrade(&res);
+                    return Self(res);
                 }
             }
-            // WRITE section
-            {
-                let mut guard = TABLE.write().unwrap();
-                // RACE CONDITION: check again if it exists
-                if let Some(s) = guard.get(hash, eq).and_then(Weak::upgrade) {
-                    cold();
-                    return Self(s);
+            // we need to create it
+            let res: Arc<String> = Arc::new(t.into());
+            guard.insert(hash, Arc::downgrade(&res), |s| {
+                let mut hasher = TableHasher::default();
+                if let Some(s) = Weak::upgrade(s) {
+                    hasher.write(s.as_bytes())
                 }
-                // we need to create it
-                let res: Arc<String> = Arc::new(t.into());
-                guard.insert(hash, Arc::downgrade(&res), |s| {
-                    let mut hasher = TableHasher::default();
-                    if let Some(s) = Weak::upgrade(s) {
-                        hasher.write(s.as_bytes())
-                    }
-                    hasher.finish()
-                });
-                return Self(res);
-            }
+                hasher.finish()
+            });
+            return Self(res);
         }
     }
 
