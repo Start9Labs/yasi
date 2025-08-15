@@ -2,7 +2,7 @@
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 name = "yasi"
 version = "0.1.5"
-edition = "2021"
+edition = "2024"
 description = "Yet Another String Interner"
 license = "MIT"
 documentation = "https://docs.rs/yasi"
@@ -11,10 +11,12 @@ keywords = ["arc", "intern", "string", "display"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = ["serde"]
+default = []
 
 [dependencies]
-ahash = "0.8.3"
+ahash = "0.8"
 hashbrown = { version = "0.13", features = ["raw"] }
-lazy_static = "1.4"
+lazy_static = "1.5"
 serde = { version = "1", optional = true }
+ts-rs = { version = "11", optional = true }
+tinyvec = "1.9"
