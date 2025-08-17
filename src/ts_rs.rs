@@ -4,7 +4,6 @@ use crate::InternedString;
 
 impl TS for InternedString {
     type WithoutGenerics = Self;
-    type OptionInnerType = Self;
     fn name() -> String {
         "string".to_owned()
     }
