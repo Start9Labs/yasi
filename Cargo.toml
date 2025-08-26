@@ -1,7 +1,7 @@
 [package]
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 name = "yasi"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "Yet Another String Interner"
 license = "MIT"
@@ -19,4 +19,4 @@ hashbrown = { version = "0.13", features = ["raw"] }
 lazy_static = "1.5"
 serde = { version = "1", optional = true }
 ts-rs = { version = "9", optional = true }
-tinyvec = "1.9"
+tinyvec = "1.10"

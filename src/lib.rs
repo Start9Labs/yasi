@@ -314,6 +314,12 @@ impl Borrow<str> for InternedString {
     }
 }
 
+impl<'a> Borrow<str> for &'a InternedString {
+    fn borrow(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 impl Clone for InternedString {
     fn clone(&self) -> Self {
         Self(self.0.clone())
