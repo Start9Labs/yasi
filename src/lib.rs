@@ -239,7 +239,10 @@ impl InternedString {
     }
 
     pub fn intern_static(s: &'static str) -> Self {
-        let hash = DisplayHasher::<TableHasher>::hash(s);
+        let (hash, stack) = DisplayHasher::<TableHasher>::hash_and_stack(&s);
+        if let Some(stack) = stack {
+            return Self(StringRepr::Stack(stack));
+        }
         let eq = |ts: &StringRef| match ts {
             StringRef::Heap(ts) => {
                 if let Some(ts) = Weak::upgrade(ts) {
