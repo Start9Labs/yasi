@@ -32,29 +32,38 @@ lazy_static::lazy_static! {
     static ref TABLE: RwLock<RawTable<StringRef>> = RwLock::new(RawTable::new());
 }
 
-type TableHasher = ahash::AHasher;
+#[derive(Default)]
+pub struct TableHasher(xxhash_rust::xxh3::Xxh3);
+impl TableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    fn finish(&self) -> u64 {
+        self.0.digest()
+    }
+}
 
-struct DisplayHasher<H: Hasher>(H, Option<ArrayVec<[u8; STACK_STR_SIZE]>>);
-impl<H: Hasher> DisplayHasher<H> {
+struct DisplayHasher(TableHasher, Option<ArrayVec<[u8; STACK_STR_SIZE]>>);
+impl DisplayHasher {
     fn finish(&self) -> (u64, Option<ArrayVec<[u8; STACK_STR_SIZE]>>) {
         (self.0.finish(), self.1)
     }
 }
-impl<H: Hasher + Default> DisplayHasher<H> {
+impl DisplayHasher {
     fn hash_and_stack<T: Display + ?Sized>(t: &T) -> (u64, Option<ArrayVec<[u8; STACK_STR_SIZE]>>) {
         use std::fmt::Write;
-        let mut h = Self(H::default(), Some(ArrayVec::new()));
+        let mut h = Self(TableHasher::default(), Some(ArrayVec::new()));
         let _ = write!(h, "{t}");
         h.finish()
     }
     fn hash<T: Display + ?Sized>(t: &T) -> u64 {
         use std::fmt::Write;
-        let mut h = Self(H::default(), None);
+        let mut h = Self(TableHasher::default(), None);
         let _ = write!(h, "{t}");
         h.finish().0
     }
 }
-impl<H: Hasher> std::fmt::Write for DisplayHasher<H> {
+impl std::fmt::Write for DisplayHasher {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
         self.0.write(s.as_bytes());
         match &mut self.1 {
@@ -91,10 +100,11 @@ impl<'a> std::fmt::Write for DisplayEq<'a> {
     }
 }
 
+#[derive(Debug)]
 struct TableString(String);
 impl Drop for TableString {
     fn drop(&mut self) {
-        let hash = DisplayHasher::<TableHasher>::hash(&self.0);
+        let hash = DisplayHasher::hash(&self.0);
         let eq = |s: &StringRef| {
             if let StringRef::Heap(s) = s
                 && s.strong_count() == 0
@@ -113,7 +123,7 @@ impl Drop for TableString {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum StringRepr {
     Heap(Arc<TableString>),
     Stack(ArrayVec<[u8; STACK_STR_SIZE]>),
@@ -160,7 +170,7 @@ impl Ord for StringRepr {
 pub struct InternedString(StringRepr);
 impl InternedString {
     pub fn intern<S: Display + Into<String>>(s: S) -> Self {
-        let (hash, stack) = DisplayHasher::<TableHasher>::hash_and_stack(&s);
+        let (hash, stack) = DisplayHasher::hash_and_stack(&s);
         if let Some(stack) = stack {
             return Self(StringRepr::Stack(stack));
         }
@@ -239,7 +249,7 @@ impl InternedString {
     }
 
     pub fn intern_static(s: &'static str) -> Self {
-        let (hash, stack) = DisplayHasher::<TableHasher>::hash_and_stack(&s);
+        let (hash, stack) = DisplayHasher::hash_and_stack(&s);
         if let Some(stack) = stack {
             return Self(StringRepr::Stack(stack));
         }
@@ -402,4 +412,19 @@ impl PartialEq<str> for InternedString {
     fn eq(&self, other: &str) -> bool {
         self.0.as_str().eq(other)
     }
+}
+
+#[test]
+fn test() {
+    struct Suffix(&'static str, &'static str);
+    impl Display for Suffix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}{}", self.0, self.1)
+        }
+    }
+    let left_src = Suffix("asdfasdfasdfasdf", ".asdf");
+    let left = InternedString::from_display(&left_src);
+    let right_src = "asdfasdfasdfasdf.asdf";
+    let right = InternedString::from(right_src);
+    assert_eq!(left, right);
 }
