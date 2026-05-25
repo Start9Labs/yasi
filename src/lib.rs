@@ -1,4 +1,5 @@
 use std::borrow::{Borrow, Cow};
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
@@ -174,59 +175,97 @@ impl InternedString {
         if let Some(stack) = stack {
             return Self(StringRepr::Stack(stack));
         }
-        let eq = |ts: &StringRef| match ts {
-            StringRef::Heap(ts) => {
-                if let Some(ts) = Weak::upgrade(ts) {
-                    DisplayEq::eq(&s, ts.0.as_str())
-                } else {
-                    false
-                }
-            }
-            StringRef::Static(ts) => DisplayEq::eq(&s, *ts),
+
+        // `TableString::drop` reacquires `TABLE.write()` to erase its hashbrown
+        // entry. If an `Arc<TableString>` we obtained from `Weak::upgrade` is
+        // the last strong reference at the moment it drops, that drop runs
+        // `TableString::drop` synchronously — and if we still hold any `TABLE`
+        // guard at that point, `std::sync::RwLock` self-deadlocks. To keep
+        // every `eq`/rehash closure's lock-window safe, we park upgraded Arcs
+        // in `keepalive` and explicitly release every TABLE guard *before*
+        // dropping it at function exit. `RefCell` because hashbrown's rehash
+        // closure takes `Fn` rather than `FnMut`.
+        let keepalive: RefCell<Vec<Arc<TableString>>> = RefCell::new(Vec::new());
+        let stash = |arc: Arc<TableString>| keepalive.borrow_mut().push(arc);
+
+        // READ section. Compute the lookup result, explicitly release the
+        // guard, then return it to the outer scope so its `Self` carries no
+        // implicit guard lifetime.
+        let read_hit: Option<Self> = {
+            let guard = TABLE.read().unwrap();
+            let result = match guard.get(hash, |ts: &StringRef| match ts {
+                StringRef::Heap(ts) => match Weak::upgrade(ts) {
+                    Some(arc) => {
+                        let matched = DisplayEq::eq(&s, arc.0.as_str());
+                        stash(arc);
+                        matched
+                    }
+                    None => false,
+                },
+                StringRef::Static(ts) => DisplayEq::eq(&s, *ts),
+            }) {
+                Some(StringRef::Heap(ts)) => Weak::upgrade(ts).map(|a| Self(StringRepr::Heap(a))),
+                Some(StringRef::Static(ts)) => Some(Self(StringRepr::Static(*ts))),
+                None => None,
+            };
+            drop(guard);
+            result
         };
-        // READ section
-        {
-            match TABLE.read().unwrap().get(hash, eq) {
-                Some(StringRef::Heap(ts)) => {
-                    if let Some(ts) = Weak::upgrade(ts) {
-                        return Self(StringRepr::Heap(ts));
-                    }
-                }
-                Some(StringRef::Static(ts)) => return Self(StringRepr::Static(*ts)),
-                _ => (),
-            }
+        if let Some(hit) = read_hit {
+            drop(keepalive);
+            return hit;
         }
-        // WRITE section
-        {
+
+        // WRITE section. Same pattern: compute, explicit drop, then return.
+        let written: Self = {
             let mut guard = TABLE.write().unwrap();
-            // RACE CONDITION: check again if it exists
-            if let Some(ts) = guard.get_mut(hash, eq) {
-                cold(); // unlikely
-                match ts {
-                    StringRef::Heap(ts) => {
-                        if let Some(ts) = Weak::upgrade(ts) {
-                            return Self(StringRepr::Heap(ts));
-                        }
+            // RACE CONDITION: check again under the write lock.
+            let already_present: Option<Self> = match guard.get_mut(hash, |ts: &StringRef| match ts {
+                StringRef::Heap(ts) => match Weak::upgrade(ts) {
+                    Some(arc) => {
+                        let matched = DisplayEq::eq(&s, arc.0.as_str());
+                        stash(arc);
+                        matched
                     }
-                    StringRef::Static(ts) => return Self(StringRepr::Static(*ts)),
+                    None => false,
+                },
+                StringRef::Static(ts) => DisplayEq::eq(&s, *ts),
+            }) {
+                Some(StringRef::Heap(ts)) => {
+                    cold(); // unlikely
+                    Weak::upgrade(ts).map(|a| Self(StringRepr::Heap(a)))
                 }
-            }
-            // we need to create it
-            let res = Arc::new(TableString(s.into()));
-            guard.insert(hash, StringRef::Heap(Arc::downgrade(&res)), |ts| {
-                let mut hasher = TableHasher::default();
-                match ts {
-                    StringRef::Heap(ts) => {
-                        if let Some(ts) = Weak::upgrade(ts) {
-                            hasher.write(ts.0.as_bytes())
+                Some(StringRef::Static(ts)) => {
+                    cold(); // unlikely
+                    Some(Self(StringRepr::Static(*ts)))
+                }
+                None => None,
+            };
+            let result = match already_present {
+                Some(hit) => hit,
+                None => {
+                    let res = Arc::new(TableString(s.into()));
+                    guard.insert(hash, StringRef::Heap(Arc::downgrade(&res)), |ts| {
+                        let mut hasher = TableHasher::default();
+                        match ts {
+                            StringRef::Heap(ts) => {
+                                if let Some(arc) = Weak::upgrade(ts) {
+                                    hasher.write(arc.0.as_bytes());
+                                    stash(arc);
+                                }
+                            }
+                            StringRef::Static(ts) => hasher.write(ts.as_bytes()),
                         }
-                    }
-                    StringRef::Static(ts) => hasher.write(ts.as_bytes()),
+                        hasher.finish()
+                    });
+                    Self(StringRepr::Heap(res))
                 }
-                hasher.finish()
-            });
-            Self(StringRepr::Heap(res))
-        }
+            };
+            drop(guard);
+            result
+        };
+        drop(keepalive);
+        written
     }
 
     pub fn from_display<S: Display + ?Sized>(s: &S) -> Self {
@@ -253,39 +292,47 @@ impl InternedString {
         if let Some(stack) = stack {
             return Self(StringRepr::Stack(stack));
         }
-        let eq = |ts: &StringRef| match ts {
-            StringRef::Heap(ts) => {
-                if let Some(ts) = Weak::upgrade(ts) {
-                    DisplayEq::eq(&s, ts.0.as_str())
-                } else {
-                    false
-                }
-            }
-            StringRef::Static(ts) => DisplayEq::eq(&s, *ts),
-        };
-        let mut guard = TABLE.write().unwrap();
+        // Same keepalive discipline as `intern` — see comment there.
+        let keepalive: RefCell<Vec<Arc<TableString>>> = RefCell::new(Vec::new());
+        let stash = |arc: Arc<TableString>| keepalive.borrow_mut().push(arc);
 
-        // check if it exists
-        if let Some(ts) = guard.get_mut(hash, eq) {
-            if !matches!(ts, StringRef::Static(_)) {
-                *ts = StringRef::Static(s);
-            }
-            return Self(StringRepr::Static(s));
-        }
+        {
+            let mut guard = TABLE.write().unwrap();
 
-        // we need to create it
-        guard.insert(hash, StringRef::Static(s), |ts| {
-            let mut hasher = TableHasher::default();
-            match ts {
-                StringRef::Heap(ts) => {
-                    if let Some(ts) = Weak::upgrade(ts) {
-                        hasher.write(ts.0.as_bytes())
+            // check if it exists
+            if let Some(ts) = guard.get_mut(hash, |ts: &StringRef| match ts {
+                StringRef::Heap(ts) => match Weak::upgrade(ts) {
+                    Some(arc) => {
+                        let matched = DisplayEq::eq(&s, arc.0.as_str());
+                        stash(arc);
+                        matched
                     }
+                    None => false,
+                },
+                StringRef::Static(ts) => DisplayEq::eq(&s, *ts),
+            }) {
+                if !matches!(ts, StringRef::Static(_)) {
+                    *ts = StringRef::Static(s);
                 }
-                StringRef::Static(ts) => hasher.write(ts.as_bytes()),
+            } else {
+                // we need to create it
+                guard.insert(hash, StringRef::Static(s), |ts| {
+                    let mut hasher = TableHasher::default();
+                    match ts {
+                        StringRef::Heap(ts) => {
+                            if let Some(arc) = Weak::upgrade(ts) {
+                                hasher.write(arc.0.as_bytes());
+                                stash(arc);
+                            }
+                        }
+                        StringRef::Static(ts) => hasher.write(ts.as_bytes()),
+                    }
+                    hasher.finish()
+                });
             }
-            hasher.finish()
-        });
+            drop(guard);
+        }
+        drop(keepalive);
         Self(StringRepr::Static(s))
     }
 }
@@ -427,4 +474,104 @@ fn test() {
     let right_src = "asdfasdfasdfasdf.asdf";
     let right = InternedString::from(right_src);
     assert_eq!(left, right);
+}
+
+#[test]
+fn intern_drop_race_does_not_deadlock() {
+    // Regression test for the self-deadlock that wedged a 0.4.0-beta.9 startd
+    // (`startd-diag-20260523T051618Z`).
+    //
+    // The buggy shape: `intern()`'s `eq` closure upgrades a `Weak<TableString>`
+    // to a temporary `Arc<TableString>`. If, between the upgrade and the
+    // closure exiting, every other strong reference to that `TableString`
+    // drops, our local Arc is the last one — and dropping it fires
+    // `TableString::drop`, which re-acquires `TABLE.write()` while we still
+    // hold a `TABLE.read()` (or `TABLE.write()`) guard. `std::sync::RwLock`
+    // self-deadlocks; all interning threads pile up; nothing recovers.
+    //
+    // Reproduction recipe: many threads, few distinct keys, each thread
+    // tight-loops `intern → drop`. The `strong_count` for each key flickers
+    // between 1 and N constantly, so the upgrade-then-drop race fires within
+    // milliseconds on the unfixed code.
+    //
+    // We detect the wedge two ways:
+    //   1. `progress` should advance well beyond a threshold during the run.
+    //   2. After signalling shutdown, all workers should join inside a watchdog
+    //      window. On unfixed yasi, joining hangs because workers are parked
+    //      in `TABLE.write()` reentrancy. We use `recv_timeout` on a sentinel
+    //      channel rather than a literal `join()` so the test can fail rather
+    //      than itself hanging.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const N_THREADS: usize = 32;
+    const N_KEYS: usize = 4;
+    const RUN: Duration = Duration::from_secs(2);
+    const PROGRESS_THRESHOLD: u64 = 1_000;
+    const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Each key must be > STACK_STR_SIZE (20) bytes so it routes through the
+    // RwLock-protected path; short strings are inlined into `StringRepr::Stack`
+    // and never touch TABLE.
+    let keys: Vec<String> = (0..N_KEYS)
+        .map(|i| format!("yasi-intern-drop-race-regression-key-{i:02}"))
+        .collect();
+    debug_assert!(keys.iter().all(|k| k.len() > STACK_STR_SIZE));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(AtomicU64::new(0));
+
+    let workers: Vec<_> = (0..N_THREADS)
+        .map(|tid| {
+            let stop = stop.clone();
+            let progress = progress.clone();
+            let key = keys[tid % N_KEYS].clone();
+            thread::Builder::new()
+                .name(format!("intern-stress-{tid}"))
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let s = InternedString::intern(key.clone());
+                        drop(s);
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+                .expect("spawn")
+        })
+        .collect();
+
+    let start = Instant::now();
+    while start.elapsed() < RUN {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mid_progress = progress.load(Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+
+    let (tx, rx) = mpsc::channel::<()>();
+    let n_workers = workers.len();
+    thread::spawn(move || {
+        for w in workers {
+            // Worker panics propagate to the join thread but we don't need to
+            // surface them — the watchdog cares about liveness only.
+            let _ = w.join();
+        }
+        let _ = tx.send(());
+    });
+
+    match rx.recv_timeout(JOIN_TIMEOUT) {
+        Ok(()) => {}
+        Err(_) => panic!(
+            "intern stress workers did not exit within {JOIN_TIMEOUT:?} after shutdown; \
+             {n_workers} workers deadlocked. progress at shutdown = {mid_progress}, \
+             threshold = {PROGRESS_THRESHOLD}",
+        ),
+    }
+
+    assert!(
+        mid_progress >= PROGRESS_THRESHOLD,
+        "expected at least {PROGRESS_THRESHOLD} total intern/drop cycles across \
+         {N_THREADS} threads in {RUN:?}; observed {mid_progress}. \
+         Workers may have wedged early.",
+    );
 }
